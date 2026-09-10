@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block title %}{{ code }} | Pasig City{% endblock %}{% block content %}<div class="narrow"><section class="panel error-page"><span class="eyebrow">{{ code }}</span><h1>{{ message }}</h1><p class="muted">Return to the portal and continue from there.</p><a class="btn primary" href="{{ url_for('home') }}">Back to Home</a></section></div>{% endblock %}
