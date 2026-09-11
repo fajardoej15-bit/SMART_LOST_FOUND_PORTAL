@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Messages | Pasig City{% endblock %}
+{% block content %}
+<div class="page-head">
+  <span class="eyebrow">PRIVATE SUPPORT</span>
+  <h1>Messages</h1>
+  <p class="muted">Contact the administrator about your surrendered item, lost report, match, or verification.</p>
+</div>
+<p class="message-legend"><strong>🔴</strong> Unread &nbsp; <strong>✓</strong> Sent &nbsp; <strong>✓✓</strong> Seen</p>
+<section class="panel">
+  <h2>Conversations</h2>
+  <div class="click-list">
+    {% for message in conversations %}
+      <a class="click-row" href="{% if message['claim_id'] %}{{ url_for('claim_conversation', claim_id=message['claim_id']) }}{% else %}{{ url_for('messages', item_id=message['item_id']) }}{% endif %}">
+        <div>
+          <b>{% if message['claim_id'] %}{{ claim_code(message['claim_id']) }}{% else %}{{ message['item_name'] or 'Report conversation' }}{% endif %}</b>
+          <span>{{ message['full_name'] or message['email'] }}{% if message['unread_count'] %} <b class="unread-badge">🔴 {{ message['unread_count'] }}</b>{% endif %}</span>
+        </div>
+        <div>
+          <span>{{ message['body'][:100] }}</span>
+          <small>{{ message['created_at'] }}</small>
+        </div>
+      </a>
+    {% else %}
+      <div class="empty">No messages yet. Open an item and select Message Admin to start a conversation.</div>
+    {% endfor %}
+  </div>
+</section>
+{% if item %}
+<section class="panel">
+  <h2>{{ item['item_name'] }}</h2>
+  <div class="chat-list">
+    {% for message in conversation %}
+      <div class="chat-message {% if message['sender_id'] == session['user_id'] %}mine{% endif %}">
+        <div>
+          <b>{% if message['sender_id'] == session['user_id'] %}You{% else %}Admin{% endif %}</b>
+          <p>{{ message['body'] }}</p>
+          <small>{{ message['created_at'] }}{% if message['sender_id'] == session['user_id'] %} &middot; {% if message['read_at'] %}✓✓ Seen {{ message['read_at'] }}{% else %}✓ Sent{% endif %}{% endif %}</small>
+        </div>
+      </div>
+    {% else %}
+      <p class="empty">No messages in this conversation yet.</p>
+    {% endfor %}
+  </div>
+  {% if admin %}
+  <form method="post" action="{{ url_for('send_message') }}" class="message-form">
+    <input type="hidden" name="item_id" value="{{ item['id'] }}">
+    <label for="message-body">Message Admin</label>
+    <textarea id="message-body" name="body" rows="3" placeholder="Type a message..." required></textarea>
+    <button class="btn primary">Send</button>
+  </form>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

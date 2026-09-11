@@ -204,11 +204,40 @@ def update_matches(conn):
                 continue
             score = score_match(lost, found)
             if score >= 25:
+                existing = conn.execute(
+                    "SELECT id FROM matches WHERE lost_item_id=? AND found_item_id=?",
+                    (lost["id"], found["id"])
+                ).fetchone()
                 conn.execute(
                     "INSERT INTO matches(lost_item_id,found_item_id,score) VALUES(?,?,?) "
                     "ON CONFLICT(lost_item_id,found_item_id) DO UPDATE SET score=excluded.score",
                     (lost["id"], found["id"], score)
                 )
+                if not existing:
+                    lost_owner = conn.execute("SELECT user_id FROM items WHERE id=?", (lost["id"],)).fetchone()
+                    finder = conn.execute("SELECT user_id FROM items WHERE id=?", (found["id"],)).fetchone()
+                    notify(
+                        conn,
+                        lost_owner["user_id"],
+                        f"Possible Match Found: {found['item_name']} may match your lost item {lost['item_name']}.",
+                        "POSSIBLE_MATCH",
+                        item_id=found["id"],
+                    )
+                    if finder["user_id"] != lost_owner["user_id"]:
+                        notify(
+                            conn,
+                            finder["user_id"],
+                            f"Possible Owner Found: The item you surrendered, {found['item_name']}, may belong to another user.",
+                            "POSSIBLE_OWNER",
+                            item_id=found["id"],
+                        )
+                    notify_admins(
+                        conn,
+                        f"Possible match detected between lost item {lost['item_name']} and found item {found['item_name']}.",
+                        "POSSIBLE_MATCH",
+                        item_id=found["id"],
+                    )
+                    log_action(conn, "MATCH_DETECTED", f"Possible match detected for reports #{lost['id']} and #{found['id']}.")
 
 
 def log_action(conn, action, details):
@@ -221,6 +250,15 @@ def notify(conn, user_id, message, notification_type="INFO", claim_id=None, item
             "INSERT INTO notifications(user_id,claim_id,item_id,message,notification_type) VALUES(?,?,?,?,?)",
             (user_id, claim_id, item_id, message, notification_type)
         )
+        log_action(conn, "NOTIFICATION_CREATED", f"{notification_type} notification created for user #{user_id}.")
+
+
+def notify_admins(conn, message, notification_type="INFO", claim_id=None, item_id=None):
+    admins = conn.execute(
+        "SELECT id FROM users WHERE upper(role)='ADMIN' AND account_status='ACTIVE'"
+    ).fetchall()
+    for admin in admins:
+        notify(conn, admin["id"], message, notification_type, claim_id, item_id)
 
 
 def claim_code(claim_id):
@@ -231,9 +269,14 @@ def claim_code(claim_id):
 def template_context():
     user = current_user()
     unread = 0
+    unread_messages = 0
     if user:
         conn = get_connection()
         unread = conn.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (user["id"],)).fetchone()[0]
+        unread_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL",
+            (user["id"],)
+        ).fetchone()[0]
         conn.close()
     return {
         "current_user": user,
@@ -244,7 +287,9 @@ def template_context():
         "avatar_url": avatar_url,
         "initials": initials,
         "unread_notifications": unread,
+        "unread_messages": unread_messages,
         "claim_code": claim_code,
+        "is_admin": is_admin(user),
         "theme": (user["theme_preference"] if user and user["theme_preference"] in ("light", "dark", "system") else "light") if user else "light"
     }
 
@@ -294,6 +339,8 @@ def register():
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "ACTIVE", now(), profile_picture)
                 )
+                log_action(conn, "USER_REGISTERED", f"{full_name} created a new account.")
+                notify_admins(conn, f"New user registration: {full_name} created an account.", "NEW_USER")
                 conn.commit()
                 conn.close()
                 flash("Account created successfully. You can now log in.", "success")
@@ -388,7 +435,7 @@ def browse():
     if (blocked := normal_user_required("Please log in to view Lost & Found reports.")):
         return blocked
     conn = get_connection()
-    conditions = ["status='ACTIVE'"]
+    conditions = ["status IN ('ACTIVE','APPROVED')"]
     values = []
     search = request.args.get("search", "").strip()
     category = request.args.get("category", "")
@@ -422,11 +469,31 @@ def item_detail(item_id):
     if (blocked := normal_user_required()):
         return blocked
     conn = get_connection()
-    item = conn.execute("SELECT items.*,users.full_name FROM items JOIN users ON users.id=items.user_id WHERE items.id=? AND items.status='ACTIVE'", (item_id,)).fetchone()
+    item = conn.execute(
+        "SELECT items.*,users.full_name FROM items JOIN users ON users.id=items.user_id WHERE items.id=? "
+        "AND (items.status IN ('ACTIVE','APPROVED') OR items.user_id=? OR upper(users.role)='ADMIN')",
+        (item_id, session["user_id"])
+    ).fetchone()
+    matched_lost = None
+    if item and item["item_type"] == "FOUND":
+        lost_reports = conn.execute(
+            "SELECT * FROM items WHERE user_id=? AND item_type='LOST' AND status IN ('ACTIVE','APPROVED')",
+            (session["user_id"],)
+        ).fetchall()
+        for lost in lost_reports:
+            if score_match(lost, item) >= 25:
+                matched_lost = lost
+                break
     conn.close()
     if item is None:
         abort(404)
-    return render_template("item_detail.html", item=item)
+    return render_template(
+        "item_detail.html",
+        item=item,
+        is_surrenderer=item["user_id"] == session["user_id"],
+        matched_lost=matched_lost,
+        can_claim=item["item_type"] == "FOUND" and item["user_id"] != session["user_id"],
+    )
 
 
 def save_report(report_type, item_id=None):
@@ -449,6 +516,36 @@ def save_report(report_type, item_id=None):
         )
         item_id = cur.lastrowid
         log_action(conn, "SUBMIT_REPORT", f"Report #{item_id} submitted for review.")
+        user = conn.execute("SELECT full_name FROM users WHERE id=?", (session["user_id"],)).fetchone()
+        label = user["full_name"] or "A user"
+        if report_type == "LOST":
+            notify_admins(
+                conn,
+                f"New Lost Item Report: {label} reported a lost item: {data['item_name']}.",
+                "NEW_LOST_REPORT",
+                item_id=item_id,
+            )
+            notify(
+                conn,
+                session["user_id"],
+                "Lost Item Report Submitted: Your lost item report has been submitted successfully.",
+                "REPORT_SUBMITTED",
+                item_id=item_id,
+            )
+        else:
+            notify_admins(
+                conn,
+                f"New Found Item Surrendered: {label} found and surrendered: {data['item_name']}.",
+                "NEW_FOUND_SURRENDERED",
+                item_id=item_id,
+            )
+            notify(
+                conn,
+                session["user_id"],
+                "Item Successfully Surrendered: Your found item has been submitted and is waiting for Admin verification.",
+                "SURRENDER_SUBMITTED",
+                item_id=item_id,
+            )
     else:
         owner = conn.execute("SELECT user_id FROM items WHERE id=?", (item_id,)).fetchone()
         if not owner or owner["user_id"] != session["user_id"]:
@@ -461,6 +558,19 @@ def save_report(report_type, item_id=None):
             (data["item_name"], data["category"], data["barangay"], data["specific_location"], data["item_date"], data["item_time"], data["description"], data["additional_details"], image, timestamp, item_id)
         )
         log_action(conn, "UPDATE_REPORT", f"Report #{item_id} updated.")
+        notify_admins(
+            conn,
+            f"Item update: Report #{item_id} ({data['item_name']}) was updated by its reporter.",
+            "ITEM_UPDATED",
+            item_id=item_id,
+        )
+        notify(
+            conn,
+            session["user_id"],
+            f"Surrendered Item Updated: There is an update regarding {data['item_name']}.",
+            "ITEM_UPDATED",
+            item_id=item_id,
+        )
     conn.commit()
     conn.close()
     return item_id
@@ -568,13 +678,17 @@ def claim(item_id):
     if (blocked := normal_user_required()):
         return blocked
     conn = get_connection()
-    item = conn.execute("SELECT * FROM items WHERE id=? AND item_type='FOUND' AND status='ACTIVE'", (item_id,)).fetchone()
+    item = conn.execute(
+        "SELECT * FROM items WHERE id=? AND item_type='FOUND' AND status IN ('ACTIVE','APPROVED')",
+        (item_id,)
+    ).fetchone()
     if not item:
         conn.close()
         abort(404)
     if item["user_id"] == session["user_id"]:
         conn.close()
-        abort(403)
+        flash("You cannot claim an item that you personally surrendered.", "danger")
+        return redirect(url_for("item_detail", item_id=item_id))
     if request.method == "POST":
         reason = request.form.get("reason", "").strip()
         proof = request.form.get("proof", "").strip()
@@ -679,11 +793,16 @@ def claim_conversation(claim_id):
     if not is_admin(current_user()) and claim_row["claimant_id"] != session["user_id"]:
         conn.close()
         abort(403)
+    changed = conn.execute(
+        "UPDATE messages SET read_at=? WHERE claim_id=? AND recipient_id=? AND read_at IS NULL",
+        (now(), claim_id, session["user_id"])
+    )
+    if changed.rowcount:
+        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) in claim conversation {claim_code(claim_id)} marked seen.")
     messages = conn.execute(
         "SELECT messages.*,users.full_name,users.email,users.profile_picture FROM messages JOIN users ON users.id=messages.sender_id WHERE messages.claim_id=? ORDER BY messages.id",
         (claim_id,)
     ).fetchall()
-    conn.execute("UPDATE notifications SET is_read=1 WHERE user_id=? AND claim_id=?", (session["user_id"], claim_id))
     conn.commit()
     conn.close()
     return render_template("claim_conversation.html", claim=claim_row, messages=messages, is_admin=is_admin(current_user()))
@@ -709,6 +828,7 @@ def claim_message(claim_id):
     recipient_id = claim_row["claimant_id"] if admin else conn.execute("SELECT id FROM users WHERE upper(role)='ADMIN' AND account_status='ACTIVE' ORDER BY id LIMIT 1").fetchone()[0]
     conn.execute("INSERT INTO messages(sender_id,recipient_id,item_id,claim_id,body) VALUES(?,?,?,?,?)", (session["user_id"], recipient_id, claim_row["item_id"], claim_id, body))
     notify(conn, recipient_id, f"New message in claim {claim_code(claim_id)}.", "NEW_MESSAGE", claim_id, claim_row["item_id"])
+    log_action(conn, "MESSAGE_SENT", f"Message sent in claim {claim_code(claim_id)}.")
     conn.commit()
     conn.close()
     flash("Your message was sent.", "success")
@@ -753,10 +873,121 @@ def notifications():
         return blocked
     conn = get_connection()
     rows = conn.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC", (session["user_id"],)).fetchall()
-    conn.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (session["user_id"],))
-    conn.commit()
     conn.close()
     return render_template("notifications.html", notifications=rows)
+
+
+@app.route("/notifications/<int:notification_id>")
+def open_notification(notification_id):
+    if (blocked := user_required()):
+        return blocked
+    conn = get_connection()
+    notification = conn.execute(
+        "SELECT * FROM notifications WHERE id=? AND user_id=?",
+        (notification_id, session["user_id"]),
+    ).fetchone()
+    if not notification:
+        conn.close()
+        abort(404)
+    if not notification["is_read"]:
+        conn.execute(
+            "UPDATE notifications SET is_read=1 WHERE id=?",
+            (notification_id,),
+        )
+        log_action(conn, "NOTIFICATION_READ", f"Notification #{notification_id} opened.")
+    conn.commit()
+    conn.close()
+    if notification["claim_id"]:
+        return redirect(url_for("claim_conversation", claim_id=notification["claim_id"]))
+    if notification["item_id"]:
+        if is_admin(current_user()):
+            return redirect(url_for("admin_report_detail", item_id=notification["item_id"]))
+        if notification["notification_type"] in {"NEW_MESSAGE", "POSSIBLE_MATCH", "POSSIBLE_OWNER"}:
+            return redirect(url_for("messages", item_id=notification["item_id"]))
+        return redirect(url_for("item_detail", item_id=notification["item_id"]))
+    return redirect(url_for("notifications"))
+
+
+@app.route("/messages")
+def messages():
+    if (blocked := normal_user_required()):
+        return blocked
+    item_id = request.args.get("item_id", type=int)
+    conn = get_connection()
+    admin = conn.execute(
+        "SELECT id,full_name,email FROM users WHERE upper(role)='ADMIN' AND account_status='ACTIVE' ORDER BY id LIMIT 1"
+    ).fetchone()
+    conversation = []
+    item = None
+    if item_id:
+        item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            conn.close()
+            abort(404)
+        has_matching_lost_report = False
+        if item["item_type"] == "FOUND" and item["user_id"] != session["user_id"]:
+            lost_reports = conn.execute(
+                "SELECT * FROM items WHERE user_id=? AND item_type='LOST' AND status IN ('ACTIVE','APPROVED')",
+                (session["user_id"],)
+            ).fetchall()
+            has_matching_lost_report = any(score_match(lost, item) >= 25 for lost in lost_reports)
+        has_existing_conversation = conn.execute(
+            "SELECT 1 FROM messages WHERE item_id=? AND (sender_id=? OR recipient_id=?) LIMIT 1",
+            (item_id, session["user_id"], session["user_id"])
+        ).fetchone()
+        if (
+            item["user_id"] != session["user_id"]
+            and not is_admin(current_user())
+            and not has_matching_lost_report
+            and not has_existing_conversation
+        ):
+            conn.close()
+            abort(403)
+        changed = conn.execute(
+            "UPDATE messages SET read_at=? WHERE item_id=? AND recipient_id=? AND read_at IS NULL",
+            (now(), item_id, session["user_id"])
+        )
+        if changed.rowcount:
+            log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) in item conversation #{item_id} marked seen.")
+        conversation = conn.execute(
+            "SELECT messages.*,users.full_name,users.email FROM messages "
+            "JOIN users ON users.id=messages.sender_id "
+            "WHERE messages.item_id=? AND messages.claim_id IS NULL "
+            "AND (messages.sender_id=? OR messages.recipient_id=?) ORDER BY messages.id",
+            (item_id, session["user_id"], session["user_id"])
+        ).fetchall()
+    rows = conn.execute(
+        "SELECT messages.*,items.item_name,users.full_name,users.email "
+        "FROM messages JOIN users ON users.id=messages.sender_id "
+        "LEFT JOIN items ON items.id=messages.item_id "
+        "WHERE messages.recipient_id=? OR messages.sender_id=? ORDER BY messages.id DESC",
+        (session["user_id"], session["user_id"])
+    ).fetchall()
+    conversations = {}
+    for message in rows:
+        key = ("claim", message["claim_id"]) if message["claim_id"] else ("item", message["item_id"])
+        if key not in conversations:
+            unread_query = (
+                "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL AND claim_id=?"
+                if message["claim_id"]
+                else "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL AND item_id=? AND claim_id IS NULL"
+            )
+            unread_count = conn.execute(
+                unread_query,
+                (session["user_id"], message["claim_id"] or message["item_id"]),
+            ).fetchone()[0]
+            conversation_data = dict(message)
+            conversation_data["unread_count"] = unread_count
+            conversations[key] = conversation_data
+    conn.commit()
+    conn.close()
+    return render_template(
+        "messages.html",
+        conversations=list(conversations.values()),
+        conversation=conversation,
+        item=item,
+        admin=admin,
+    )
 
 
 @app.route("/claims/<int:claim_id>/resolution")
@@ -804,6 +1035,7 @@ def send_message():
         abort(403)
     conn.execute("INSERT INTO messages(sender_id,recipient_id,item_id,body) VALUES(?,?,?,?)", (session["user_id"], admin["id"], item_id, body))
     notify(conn, admin["id"], "A user sent a new report message.", "NEW_MESSAGE", None, item_id)
+    log_action(conn, "MESSAGE_SENT", f"User sent a message about report #{item_id}.")
     conn.commit()
     conn.close()
     flash("Your message was sent to the administrator.", "success")
@@ -833,6 +1065,14 @@ def admin_dashboard():
         "FROM items JOIN users ON users.id=items.user_id WHERE items.status='PENDING REVIEW' ORDER BY items.id DESC LIMIT 5"
     ).fetchall()
     users = conn.execute("SELECT id,full_name,email,role,account_status,profile_picture FROM users ORDER BY id DESC LIMIT 5").fetchall()
+    admin_notifications = conn.execute(
+        "SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 5",
+        (session["user_id"],)
+    ).fetchall()
+    activity_logs = conn.execute(
+        "SELECT audit_logs.*,users.full_name FROM audit_logs "
+        "LEFT JOIN users ON users.id=audit_logs.user_id ORDER BY audit_logs.id DESC LIMIT 10"
+    ).fetchall()
     message_rows = conn.execute(
         "SELECT messages.*,users.full_name,users.email,users.profile_picture "
         "FROM messages JOIN users ON users.id=messages.sender_id ORDER BY messages.id DESC LIMIT 50"
@@ -843,7 +1083,7 @@ def admin_dashboard():
         key = (message["claim_id"], message["item_id"] if message["claim_id"] is None else None)
         if key not in conversations:
             conversations[key] = message
-    return render_template("admin.html", stats=stats, claims=claims, reports=reports, users=users, conversations=list(conversations.values())[:5])
+    return render_template("admin.html", stats=stats, claims=claims, reports=reports, users=users, conversations=list(conversations.values())[:5], admin_notifications=admin_notifications, activity_logs=activity_logs)
 
 
 @app.route("/admin/users")
@@ -897,6 +1137,12 @@ def admin_report_detail(item_id):
         return blocked
     conn = get_connection()
     report_row = conn.execute("SELECT items.*,users.full_name,users.email,users.profile_picture FROM items JOIN users ON users.id=items.user_id WHERE items.id=?", (item_id,)).fetchone()
+    changed = conn.execute(
+        "UPDATE messages SET read_at=? WHERE item_id=? AND recipient_id=? AND read_at IS NULL",
+        (now(), item_id, session["user_id"])
+    )
+    if changed.rowcount:
+        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) for report #{item_id} marked seen.")
     messages = conn.execute("SELECT messages.*,users.full_name,users.email,users.profile_picture FROM messages JOIN users ON users.id=messages.sender_id WHERE messages.item_id=? AND messages.claim_id IS NULL ORDER BY messages.id", (item_id,)).fetchall()
     conn.close()
     if not report_row:
@@ -927,6 +1173,12 @@ def admin_claim_detail(claim_id):
         "FROM claims JOIN items ON items.id=claims.item_id JOIN users ON users.id=claims.claimant_id WHERE claims.id=?",
         (claim_id,)
     ).fetchone()
+    changed = conn.execute(
+        "UPDATE messages SET read_at=? WHERE claim_id=? AND recipient_id=? AND read_at IS NULL",
+        (now(), claim_id, session["user_id"])
+    )
+    if changed.rowcount:
+        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) for claim {claim_code(claim_id)} marked seen.")
     messages = conn.execute("SELECT messages.*,users.full_name,users.email,users.profile_picture FROM messages JOIN users ON users.id=messages.sender_id WHERE messages.claim_id=? ORDER BY messages.id", (claim_id,)).fetchall()
     conn.close()
     if not claim_row:
@@ -940,12 +1192,19 @@ def admin_messages():
         return blocked
     conn = get_connection()
     rows = conn.execute("SELECT messages.*,users.full_name,users.email,items.item_name FROM messages JOIN users ON users.id=messages.sender_id LEFT JOIN items ON items.id=messages.item_id ORDER BY messages.id DESC").fetchall()
-    conn.close()
     conversations = {}
     for message in rows:
         key = (message["claim_id"], message["item_id"] if message["claim_id"] is None else None)
         if key not in conversations:
-            conversations[key] = message
+            unread_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL AND "
+                + ("claim_id=?" if message["claim_id"] else "item_id=? AND claim_id IS NULL"),
+                (session["user_id"], message["claim_id"] or message["item_id"]),
+            ).fetchone()[0]
+            conversation_data = dict(message)
+            conversation_data["unread_count"] = unread_count
+            conversations[key] = conversation_data
+    conn.close()
     return render_template("admin_messages.html", conversations=list(conversations.values()))
 
 
@@ -975,6 +1234,42 @@ def admin_report_action(item_id, action):
         notify(conn, owner["user_id"], f"Administrator update for report #{item_id}: {notes}", "REPORT_UPDATE", None, item_id)
     log_action(conn, f"REPORT_{action.upper()}", f"Report #{item_id} marked {statuses[action]}.")
     update_matches(conn)
+    owner_message = {
+        "ACTIVE": "Surrendered Item Updated: Your report was approved and is now visible to the community.",
+        "REJECTED": "Surrendered Item Updated: Your report was rejected by the Admin. Check Messages for more information.",
+        "RESOLVED": "Item Status Changed: Your report has been marked returned/resolved.",
+        "PENDING REVIEW": "Match Updated: Your report is under Admin review.",
+    }.get(statuses[action])
+    if owner_message:
+        notify(conn, row["user_id"], owner_message, "REPORT_STATUS_UPDATED", None, item_id)
+    if statuses[action] == "ACTIVE" and row["status"] != "ACTIVE" and row["item_type"] == "FOUND":
+        matches = conn.execute(
+            "SELECT matches.lost_item_id,items.user_id AS owner_id,items.item_name "
+            "FROM matches JOIN items ON items.id=matches.lost_item_id "
+            "WHERE matches.found_item_id=?",
+            (item_id,)
+        ).fetchall()
+        for match in matches:
+            if match["owner_id"] == row["user_id"]:
+                continue
+            finder_message = (
+                f"Update on Your Surrendered Item: {row['item_name']} has been reviewed by the Admin. "
+                "Please check your Messages for more information."
+            )
+            owner_message = (
+                f"Possible Match Found: A surrendered item may match the item you reported as lost "
+                f"({match['item_name']}). Please check your Messages for more information."
+            )
+            notify(conn, row["user_id"], finder_message, "SURRENDERED_ITEM_REVIEWED", None, item_id)
+            notify(conn, match["owner_id"], owner_message, "POSSIBLE_MATCH", None, item_id)
+            conn.execute(
+                "INSERT INTO messages(sender_id,recipient_id,item_id,body) VALUES(?,?,?,?)",
+                (session["user_id"], row["user_id"], item_id, finder_message)
+            )
+            conn.execute(
+                "INSERT INTO messages(sender_id,recipient_id,item_id,body) VALUES(?,?,?,?)",
+                (session["user_id"], match["owner_id"], item_id, owner_message)
+            )
     conn.commit()
     conn.close()
     flash(f"Report #{item_id} updated.", "success")
@@ -997,6 +1292,7 @@ def admin_report_message(item_id):
         return redirect(url_for("admin_report_detail", item_id=item_id))
     conn.execute("INSERT INTO messages(sender_id,recipient_id,item_id,body) VALUES(?,?,?,?)", (session["user_id"], report_row["user_id"], item_id, body))
     notify(conn, report_row["user_id"], "Administrator sent a message about your report.", "NEW_MESSAGE", None, item_id)
+    log_action(conn, "MESSAGE_SENT", f"Administrator sent a message about report #{item_id}.")
     conn.commit()
     conn.close()
     flash("Message sent to the reporter.", "success")
