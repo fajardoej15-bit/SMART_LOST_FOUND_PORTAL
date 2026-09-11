@@ -1,6 +1,7 @@
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+import os
 import re
 import secrets
 
@@ -713,5 +714,6 @@ def server_error(error): return render_template("error.html", code=500, message=
 
 if __name__ == "__main__":
     init_db()
-    print("SMART LOST & FOUND PORTAL - PASIG CITY: http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"SMART LOST & FOUND PORTAL - PASIG CITY: http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=True)
