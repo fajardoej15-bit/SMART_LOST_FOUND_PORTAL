@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import re
 import secrets
+import sqlite3
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
@@ -261,8 +262,74 @@ def notify_admins(conn, message, notification_type="INFO", claim_id=None, item_i
         notify(conn, admin["id"], message, notification_type, claim_id, item_id)
 
 
+def resolve_linked_reports(conn, item_id, timestamp, claim_id=None, excluded_user_ids=()):
+    """Close the matched report and notify its owner when a case is completed."""
+    item = conn.execute(
+        "SELECT id,item_type,item_name,user_id FROM items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    if not item:
+        return []
+
+    if item["item_type"] == "FOUND":
+        linked = conn.execute(
+            "SELECT items.id,items.item_type,items.item_name,items.user_id "
+            "FROM matches JOIN items ON items.id=matches.lost_item_id "
+            "WHERE matches.found_item_id=?",
+            (item_id,),
+        ).fetchall()
+    else:
+        linked = conn.execute(
+            "SELECT items.id,items.item_type,items.item_name,items.user_id "
+            "FROM matches JOIN items ON items.id=matches.found_item_id "
+            "WHERE matches.lost_item_id=?",
+            (item_id,),
+        ).fetchall()
+
+    resolved = []
+    for linked_item in linked:
+        if linked_item["id"] == item_id:
+            continue
+        changed = conn.execute(
+            "UPDATE items SET status='RESOLVED',updated_at=? "
+            "WHERE id=? AND status!='RESOLVED'",
+            (timestamp, linked_item["id"]),
+        )
+        if changed.rowcount:
+            resolved.append(linked_item)
+            if linked_item["user_id"] not in excluded_user_ids:
+                notify(
+                    conn,
+                    linked_item["user_id"],
+                    f"Your {linked_item['item_type'].lower()} report for {linked_item['item_name']} is now resolved. "
+                    "The matched lost-and-found case has been completed.",
+                    "REPORT_RESOLVED",
+                    claim_id,
+                    linked_item["id"],
+                )
+    return resolved
+
+
 def claim_code(claim_id):
     return f"CLM-{claim_id:04d}"
+
+
+def mark_messages_read(conn, user_id, item_id=None, claim_id=None):
+    conditions = ["recipient_id=?", "read_at IS NULL"]
+    values = [user_id]
+    if claim_id is not None:
+        conditions.append("claim_id=?")
+        values.append(claim_id)
+    elif item_id is not None:
+        conditions.extend(["item_id=?", "claim_id IS NULL"])
+        values.append(item_id)
+    changed = conn.execute(
+        f"UPDATE messages SET read_at=? WHERE {' AND '.join(conditions)}",
+        [now(), *values],
+    )
+    if changed.rowcount:
+        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) marked seen.")
+    return changed.rowcount
 
 
 @app.context_processor
@@ -874,7 +941,7 @@ def notifications():
     conn = get_connection()
     rows = conn.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC", (session["user_id"],)).fetchall()
     conn.close()
-    return render_template("notifications.html", notifications=rows)
+    return render_template("notifications.html", notifications=rows, admin_view=is_admin(current_user()))
 
 
 @app.route("/notifications/<int:notification_id>")
@@ -943,12 +1010,7 @@ def messages():
         ):
             conn.close()
             abort(403)
-        changed = conn.execute(
-            "UPDATE messages SET read_at=? WHERE item_id=? AND recipient_id=? AND read_at IS NULL",
-            (now(), item_id, session["user_id"])
-        )
-        if changed.rowcount:
-            log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) in item conversation #{item_id} marked seen.")
+        mark_messages_read(conn, session["user_id"], item_id=item_id)
         conversation = conn.execute(
             "SELECT messages.*,users.full_name,users.email FROM messages "
             "JOIN users ON users.id=messages.sender_id "
@@ -963,6 +1025,8 @@ def messages():
         "WHERE messages.recipient_id=? OR messages.sender_id=? ORDER BY messages.id DESC",
         (session["user_id"], session["user_id"])
     ).fetchall()
+    if not item_id:
+        mark_messages_read(conn, session["user_id"])
     conversations = {}
     for message in rows:
         key = ("claim", message["claim_id"]) if message["claim_id"] else ("item", message["item_id"])
@@ -987,6 +1051,7 @@ def messages():
         conversation=conversation,
         item=item,
         admin=admin,
+        unread_messages=0 if not item_id else None,
     )
 
 
@@ -1074,8 +1139,17 @@ def admin_dashboard():
         "LEFT JOIN users ON users.id=audit_logs.user_id ORDER BY audit_logs.id DESC LIMIT 10"
     ).fetchall()
     message_rows = conn.execute(
-        "SELECT messages.*,users.full_name,users.email,users.profile_picture "
-        "FROM messages JOIN users ON users.id=messages.sender_id ORDER BY messages.id DESC LIMIT 50"
+        "SELECT messages.*, "
+        "CASE WHEN messages.sender_id=? THEN recipient.full_name ELSE sender.full_name END AS full_name, "
+        "CASE WHEN messages.sender_id=? THEN recipient.email ELSE sender.email END AS email, "
+        "items.item_name "
+        "FROM messages "
+        "JOIN users AS sender ON sender.id=messages.sender_id "
+        "JOIN users AS recipient ON recipient.id=messages.recipient_id "
+        "LEFT JOIN items ON items.id=messages.item_id "
+        "WHERE messages.sender_id=? OR messages.recipient_id=? "
+        "ORDER BY messages.id DESC LIMIT 50",
+        (session["user_id"], session["user_id"], session["user_id"], session["user_id"]),
     ).fetchall()
     conn.close()
     conversations = {}
@@ -1111,6 +1185,85 @@ def admin_user_detail(user_id):
     return render_template("admin_user_detail.html", user=user, reports=reports, claims=claims)
 
 
+@app.post("/admin/users/<int:user_id>/delete")
+def admin_delete_user(user_id):
+    if (blocked := admin_required()):
+        return blocked
+    if user_id == session["user_id"]:
+        flash("You cannot delete the administrator account you are currently using.", "danger")
+        return redirect(url_for("admin_user_detail", user_id=user_id))
+
+    conn = get_connection()
+    user = conn.execute(
+        "SELECT id,full_name,email,profile_picture FROM users WHERE id=?",
+        (user_id,),
+    ).fetchone()
+    if not user:
+        conn.close()
+        abort(404)
+
+    report_files = [
+        row["image_filename"]
+        for row in conn.execute(
+            "SELECT image_filename FROM items WHERE user_id=? AND image_filename IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+    ]
+    claim_files = [
+        filename
+        for row in conn.execute(
+            "SELECT proof_filename,id_filename FROM claims "
+            "WHERE claimant_id=? OR item_id IN (SELECT id FROM items WHERE user_id=?)",
+            (user_id, user_id),
+        ).fetchall()
+        for filename in (row["proof_filename"], row["id_filename"])
+        if filename
+    ]
+    item_filter = "(SELECT id FROM items WHERE user_id=?)"
+    claim_filter = (
+        "(SELECT id FROM claims WHERE claimant_id=? "
+        "OR item_id IN (SELECT id FROM items WHERE user_id=?))"
+    )
+    try:
+        conn.execute(
+            "DELETE FROM messages WHERE sender_id=? OR recipient_id=? "
+            f"OR item_id IN {item_filter} OR claim_id IN {claim_filter}",
+            (user_id, user_id, user_id, user_id, user_id),
+        )
+        conn.execute(
+            "DELETE FROM notifications WHERE user_id=? "
+            f"OR item_id IN {item_filter} OR claim_id IN {claim_filter}",
+            (user_id, user_id, user_id, user_id),
+        )
+        conn.execute(
+            f"DELETE FROM matches WHERE lost_item_id IN {item_filter} OR found_item_id IN {item_filter}",
+            (user_id, user_id),
+        )
+        conn.execute(
+            "DELETE FROM claims WHERE claimant_id=? OR item_id IN "
+            "(SELECT id FROM items WHERE user_id=?)",
+            (user_id, user_id),
+        )
+        conn.execute("DELETE FROM items WHERE user_id=?", (user_id,))
+        conn.execute("UPDATE audit_logs SET user_id=NULL WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        conn.close()
+        flash("The user could not be deleted because related records are still in use.", "danger")
+        return redirect(url_for("admin_user_detail", user_id=user_id))
+    conn.close()
+
+    delete_avatar(user["profile_picture"])
+    for filename in report_files + claim_files:
+        path = PRIVATE_UPLOAD_DIR / Path(filename).name
+        if path.exists():
+            path.unlink()
+    flash(f"User {user['full_name'] or user['email']} was deleted.", "success")
+    return redirect(url_for("admin_users"))
+
+
 @app.route("/admin/reports")
 def admin_reports():
     if (blocked := admin_required()):
@@ -1137,13 +1290,9 @@ def admin_report_detail(item_id):
         return blocked
     conn = get_connection()
     report_row = conn.execute("SELECT items.*,users.full_name,users.email,users.profile_picture FROM items JOIN users ON users.id=items.user_id WHERE items.id=?", (item_id,)).fetchone()
-    changed = conn.execute(
-        "UPDATE messages SET read_at=? WHERE item_id=? AND recipient_id=? AND read_at IS NULL",
-        (now(), item_id, session["user_id"])
-    )
-    if changed.rowcount:
-        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) for report #{item_id} marked seen.")
+    mark_messages_read(conn, session["user_id"], item_id=item_id)
     messages = conn.execute("SELECT messages.*,users.full_name,users.email,users.profile_picture FROM messages JOIN users ON users.id=messages.sender_id WHERE messages.item_id=? AND messages.claim_id IS NULL ORDER BY messages.id", (item_id,)).fetchall()
+    conn.commit()
     conn.close()
     if not report_row:
         abort(404)
@@ -1173,13 +1322,9 @@ def admin_claim_detail(claim_id):
         "FROM claims JOIN items ON items.id=claims.item_id JOIN users ON users.id=claims.claimant_id WHERE claims.id=?",
         (claim_id,)
     ).fetchone()
-    changed = conn.execute(
-        "UPDATE messages SET read_at=? WHERE claim_id=? AND recipient_id=? AND read_at IS NULL",
-        (now(), claim_id, session["user_id"])
-    )
-    if changed.rowcount:
-        log_action(conn, "MESSAGE_SEEN", f"{changed.rowcount} message(s) for claim {claim_code(claim_id)} marked seen.")
+    mark_messages_read(conn, session["user_id"], claim_id=claim_id)
     messages = conn.execute("SELECT messages.*,users.full_name,users.email,users.profile_picture FROM messages JOIN users ON users.id=messages.sender_id WHERE messages.claim_id=? ORDER BY messages.id", (claim_id,)).fetchall()
+    conn.commit()
     conn.close()
     if not claim_row:
         abort(404)
@@ -1191,10 +1336,23 @@ def admin_messages():
     if (blocked := admin_required()):
         return blocked
     conn = get_connection()
-    rows = conn.execute("SELECT messages.*,users.full_name,users.email,items.item_name FROM messages JOIN users ON users.id=messages.sender_id LEFT JOIN items ON items.id=messages.item_id ORDER BY messages.id DESC").fetchall()
+    mark_messages_read(conn, session["user_id"])
+    rows = conn.execute(
+        "SELECT messages.*, "
+        "CASE WHEN messages.sender_id=? THEN recipient.full_name ELSE sender.full_name END AS full_name, "
+        "CASE WHEN messages.sender_id=? THEN recipient.email ELSE sender.email END AS email, "
+        "items.item_name "
+        "FROM messages "
+        "JOIN users AS sender ON sender.id=messages.sender_id "
+        "JOIN users AS recipient ON recipient.id=messages.recipient_id "
+        "LEFT JOIN items ON items.id=messages.item_id "
+        "WHERE messages.sender_id=? OR messages.recipient_id=? "
+        "ORDER BY messages.id DESC",
+        (session["user_id"], session["user_id"], session["user_id"], session["user_id"]),
+    ).fetchall()
     conversations = {}
     for message in rows:
-        key = (message["claim_id"], message["item_id"] if message["claim_id"] is None else None)
+        key = ("claim", message["claim_id"]) if message["claim_id"] else ("item", message["item_id"])
         if key not in conversations:
             unread_count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL AND "
@@ -1204,8 +1362,9 @@ def admin_messages():
             conversation_data = dict(message)
             conversation_data["unread_count"] = unread_count
             conversations[key] = conversation_data
+    conn.commit()
     conn.close()
-    return render_template("admin_messages.html", conversations=list(conversations.values()))
+    return render_template("admin_messages.html", conversations=list(conversations.values()), unread_messages=0)
 
 
 @app.route("/admin/messages/<int:claim_id>")
@@ -1227,6 +1386,10 @@ def admin_report_action(item_id, action):
     if not row:
         conn.close()
         abort(404)
+    if action == "approve" and row["status"] == "ACTIVE":
+        conn.close()
+        flash(f"Report #{item_id} has already been approved.", "info")
+        return redirect(url_for("admin_report_detail", item_id=item_id))
     notes = request.form.get("notes", "").strip()
     conn.execute("UPDATE items SET status=?,review_notes=?,updated_at=? WHERE id=?", (statuses[action], notes, now(), item_id))
     if notes:
@@ -1242,6 +1405,17 @@ def admin_report_action(item_id, action):
     }.get(statuses[action])
     if owner_message:
         notify(conn, row["user_id"], owner_message, "REPORT_STATUS_UPDATED", None, item_id)
+    if statuses[action] == "RESOLVED":
+        linked_reports = resolve_linked_reports(conn, item_id, now())
+        if linked_reports:
+            notify(
+                conn,
+                row["user_id"],
+                f"Report #{item_id} and its matched report are now resolved. The lost-and-found case is complete.",
+                "REPORT_RESOLVED",
+                None,
+                item_id,
+            )
     if statuses[action] == "ACTIVE" and row["status"] != "ACTIVE" and row["item_type"] == "FOUND":
         matches = conn.execute(
             "SELECT matches.lost_item_id,items.user_id AS owner_id,items.item_name "
@@ -1321,6 +1495,10 @@ def admin_claim_action(claim_id, action):
         conn.close()
         abort(404)
     status = statuses[action]
+    if action == "approve" and claim_row["status"] == "APPROVED":
+        conn.close()
+        flash(f"Claim {claim_code(claim_id)} has already been approved.", "info")
+        return redirect(url_for("admin_claim_detail", claim_id=claim_id))
     if status == "RESOLVED" and claim_row["status"] != "APPROVED":
         conn.close()
         flash("Only an approved claim can be marked resolved after handover.", "danger")
@@ -1347,9 +1525,48 @@ def admin_claim_action(claim_id, action):
             )
             if status == "RESOLVED":
                 conn.execute("UPDATE items SET status='RESOLVED',updated_at=? WHERE id=?", (timestamp, claim_row["report_id"]))
-                notify(conn, claim_row["claimant_id"], f"Claim {claim_code(claim_id)} for {claim_row['item_name']} has been resolved. The item was released to the rightful owner.", "CLAIM_RESOLVED", claim_id, claim_row["report_id"])
+                linked_reports = resolve_linked_reports(
+                    conn,
+                    claim_row["report_id"],
+                    timestamp,
+                    claim_id,
+                    {claim_row["claimant_id"], claim_row["finder_id"]},
+                )
+                notify(
+                    conn,
+                    claim_row["claimant_id"],
+                    f"Claim {claim_code(claim_id)} for {claim_row['item_name']} has been resolved. "
+                    "The item was released to the rightful owner and the lost-and-found case is complete.",
+                    "CLAIM_RESOLVED",
+                    claim_id,
+                    claim_row["report_id"],
+                )
                 if claim_row["finder_id"] != claim_row["claimant_id"]:
-                    notify(conn, claim_row["finder_id"], f"The item you reported as found, {claim_row['item_name']}, was successfully claimed by its rightful owner. Thank you for helping return it. Claim {claim_code(claim_id)} was resolved on {timestamp}.", "FINDER_CLAIM_RESOLVED", claim_id, claim_row["report_id"])
+                    notify(
+                        conn,
+                        claim_row["finder_id"],
+                        f"The item you reported as found, {claim_row['item_name']}, was successfully claimed by its rightful owner. "
+                        f"Both reports are now resolved. Claim {claim_code(claim_id)} was completed on {timestamp}.",
+                        "FINDER_CLAIM_RESOLVED",
+                        claim_id,
+                        claim_row["report_id"],
+                    )
+                if linked_reports:
+                    lost_owner_ids = {
+                        linked_item["user_id"]
+                        for linked_item in linked_reports
+                        if linked_item["user_id"] not in (claim_row["claimant_id"], claim_row["finder_id"])
+                    }
+                    for lost_owner_id in lost_owner_ids:
+                        notify(
+                            conn,
+                            lost_owner_id,
+                            f"The matched lost-and-found case for {claim_row['item_name']} is complete. "
+                            "Both reports have been marked resolved.",
+                            "REPORT_RESOLVED",
+                            claim_id,
+                            claim_row["report_id"],
+                        )
             elif status == "APPROVED":
                 release_area = release_location or claim_row["report_barangay"]
                 claimant_message = f"Your claim request for {claim_row['item_name']} has been approved. Please claim the item at {release_area}, {release_barangay or claim_row['report_barangay']}. Bring {required_documents or 'your valid identification and proof of ownership'} and follow the administrator's instructions before visiting. Coordinate with {coordination_contact or 'the assigned administrator'} first."

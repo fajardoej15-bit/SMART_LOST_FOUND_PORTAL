@@ -1,1 +1,35 @@
-{% extends "base.html" %}{% block title %}Notifications | Pasig City{% endblock %}{% block content %}<div class="page-head"><span class="eyebrow">UPDATES</span><h1>Notifications</h1><p class="muted">Claim, release, message, and report updates connected to your account.</p></div><section class="panel"><div class="notification-list">{% for notification in notifications %}<a class="notification-item{% if not notification['is_read'] %} unread{% endif %}" href="{{ url_for('open_notification',notification_id=notification['id']) }}"><span class="status status-active">{{ notification['notification_type']|replace('_',' ')|title }}</span>{% if not notification['is_read'] %}<span aria-label="Unread">🔴</span>{% endif %}<p>{{ notification['message'] }}</p><small>{{ notification['created_at'] }}</small><span>Open update</span></a>{% else %}<div class="empty">You have no notifications.</div>{% endfor %}</div></section>{% endblock %}
+{% extends "base.html" %}
+{% block title %}Notifications | Pasig City{% endblock %}
+{% block content %}
+<div class="page-head">
+  <span class="eyebrow">{% if admin_view %}ADMIN CENTER{% else %}UPDATES{% endif %}</span>
+  <h1>{% if admin_view %}Admin Notifications{% else %}Notifications{% endif %}</h1>
+  <p class="muted">{% if admin_view %}Stay on top of new reports, claims, matches, and private conversations that need your attention.{% else %}Claim, release, message, and report updates connected to your account.{% endif %}</p>
+</div>
+<section class="panel{% if admin_view %} admin-notifications-panel{% endif %}">
+  {% if admin_view %}
+    <div class="notification-toolbar">
+      <h2>Recent activity</h2>
+      <span class="muted">{{ notifications|length }} update{% if notifications|length != 1 %}s{% endif %}</span>
+    </div>
+  {% endif %}
+  <div class="notification-list">
+    {% for notification in notifications %}
+      <a class="notification-item{% if admin_view %} admin-notification-item{% endif %}{% if not notification['is_read'] %} unread{% endif %}" href="{{ url_for('open_notification',notification_id=notification['id']) }}">
+        <span class="notification-icon" aria-hidden="true">{% if notification['notification_type'] in ('NEW_CLAIM', 'NEW_PROOF') %}⚑{% elif notification['notification_type'] in ('NEW_MESSAGE',) %}✉{% elif notification['notification_type'] in ('POSSIBLE_MATCH', 'POSSIBLE_OWNER') %}↔{% else %}●{% endif %}</span>
+        <div class="notification-content">
+          <div class="notification-title">
+            <strong>{{ notification['notification_type']|replace('_',' ')|title }}</strong>
+            {% if not notification['is_read'] %}<span class="unread-label">New</span>{% endif %}
+          </div>
+          <p>{{ notification['message'] }}</p>
+          <small>{{ notification['created_at'] }}</small>
+        </div>
+        <span class="notification-open">Open update &rarr;</span>
+      </a>
+    {% else %}
+      <div class="empty">{% if admin_view %}You are all caught up. No admin activity needs your attention.{% else %}You have no notifications.{% endif %}</div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
