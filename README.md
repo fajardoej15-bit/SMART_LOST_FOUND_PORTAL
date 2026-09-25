@@ -57,6 +57,13 @@ The system aims to organize the lost-and-found process in a centralized platform
   * Supports the team in reviewing and organizing project outputs.
   * Coordinates with Erica Gallogo regarding documentation tasks.
 
+* **Progress Report Documentation:** Jhayson Vidal
+
+* Prepares and maintains documentation of the team's development progress.
+* Records completed tasks, ongoing activities, and development milestones.
+* Documents updates and improvements made to the system throughout the development process.
+* Assists in preparing progress reports for project monitoring and presentation.
+* Coordinates with the development team to ensure that progress reports accurately reflect the current status of the system.
 
 ## Key System Features
 

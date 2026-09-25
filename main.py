@@ -34,6 +34,19 @@ app.config.update(
     ALLOWED_EXTENSIONS={"png", "jpg", "jpeg", "gif", "webp", "pdf"},
     AVATAR_EXTENSIONS={"png", "jpg", "jpeg"},
 )
+# TEMPORARY_RENDER_MAIL_DIAGNOSTIC: remove after checking the deployed startup logs.
+_mail_password = os.getenv("MAIL_PASSWORD", "")
+app.logger.info(
+    "Render mail environment diagnostic: "
+    "MAIL_USERNAME_nonempty=%s MAIL_PASSWORD_nonempty=%s MAIL_PASSWORD_length=%d "
+    "MAIL_SERVER_exists=%s MAIL_PORT_exists=%s MAIL_USE_TLS_exists=%s",
+    bool(os.getenv("MAIL_USERNAME", "").strip()),
+    bool(_mail_password),
+    len(_mail_password),
+    bool(os.getenv("MAIL_SERVER")),
+    bool(os.getenv("MAIL_PORT")),
+    bool(os.getenv("MAIL_USE_TLS")),
+)
 init_db()
 
 CATEGORIES = [
