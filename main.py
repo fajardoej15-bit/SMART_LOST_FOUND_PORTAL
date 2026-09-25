@@ -121,7 +121,15 @@ def send_otp_email(email, full_name, code):
         with urlopen(request, timeout=20) as response:
             if response.status not in {200, 201}:
                 raise RuntimeError("The email service rejected the verification email.")
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+    except HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        app.logger.error(
+            "Resend API HTTP error: status=%s body=%s",
+            exc.code,
+            response_body,
+        )
+        raise RuntimeError("Unable to send the verification email. Please try again later.") from exc
+    except (URLError, TimeoutError, OSError) as exc:
         raise RuntimeError("Unable to send the verification email. Please try again later.") from exc
 
 
