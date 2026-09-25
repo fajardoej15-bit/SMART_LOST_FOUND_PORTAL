@@ -91,46 +91,71 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    api_key = os.getenv("RESEND_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Email verification is not configured. Please contact the administrator.")
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    sender_name = os.getenv("BREVO_SENDER_NAME", "").strip()
+    if not api_key or not sender_email or not sender_name:
+        app.logger.error(
+            "Brevo configuration missing: api_key=%s, sender_email=%s, sender_name=%s",
+            "SET" if api_key else "MISSING",
+            "SET" if sender_email else "MISSING",
+            "SET" if sender_name else "MISSING",
+        )
+        return False
 
     payload = {
-        "from": "SMART Lost & Found <onboarding@resend.dev>",
-        "to": [email],
+        "sender": {
+            "name": sender_name,
+            "email": sender_email,
+        },
+        "to": [{"email": email, "name": full_name}],
         "subject": "SMART Lost & Found - Email Verification",
-        "text": (
+        "textContent": (
             f"Hello {full_name},\n\n"
-            "Thank you for registering with SMART Lost & Found Pasig.\n\n"
-            f"Your verification code is:\n\n{code}\n\n"
+            f"Your SMART Lost & Found verification code is: {code}\n\n"
             "This code expires in 10 minutes.\n\n"
-            "If you did not create this account, you can ignore this email.\n\n"
-            "Thank you,\nSMART Lost & Found Pasig"
+            "If you did not create this account, you can ignore this email."
         ),
     }
     request = Request(
-        "https://api.resend.com/emails",
+        "https://api.brevo.com/v3/smtp/email",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "api-key": api_key,
         },
         method="POST",
     )
     try:
+        app.logger.info("Attempting Brevo API request to https://api.brevo.com/v3/smtp/email")
         with urlopen(request, timeout=20) as response:
-            if response.status not in {200, 201}:
-                raise RuntimeError("The email service rejected the verification email.")
+            app.logger.info("Brevo API response: status=%s", response.status)
+            return 200 <= response.status < 300
     except HTTPError as exc:
         response_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_response = json.loads(response_body)
+        except json.JSONDecodeError:
+            error_response = {}
+        error_code = error_response.get("code", "unknown")
+        error_message = str(error_response.get("message", "Unstructured API error"))
+        error_message = error_message.replace(api_key, "[redacted]")
+        error_message = error_message.replace(code, "[redacted]")[:500]
         app.logger.error(
-            "Resend API HTTP error: status=%s body=%s",
+            "Brevo API HTTP error: status=%s code=%s message=%s",
             exc.code,
-            response_body,
+            error_code,
+            error_message,
         )
-        raise RuntimeError("Unable to send the verification email. Please try again later.") from exc
+        return False
     except (URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError("Unable to send the verification email. Please try again later.") from exc
+        app.logger.error(
+            "Brevo API connection error: type=%s message=%s",
+            type(exc).__name__,
+            str(exc),
+        )
+        return False
 
 
 def issue_otp(conn, user):
@@ -144,7 +169,7 @@ def issue_otp(conn, user):
         "last_sent_at=excluded.last_sent_at",
         (user["id"], otp_hash(code), (sent_at + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat(), 0, 0, sent_at.isoformat()),
     )
-    send_otp_email(user["email"], user["full_name"] or "there", code)
+    return send_otp_email(user["email"], user["full_name"] or "there", code)
 
 
 def pending_verification_user():
@@ -511,7 +536,8 @@ def register():
                 )
                 pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 try:
-                    issue_otp(conn, pending_user)
+                    if not issue_otp(conn, pending_user):
+                        raise RuntimeError("Unable to send the verification email. Please try again later.")
                 except (OSError, RuntimeError, ValueError) as exc:
                     conn.rollback()
                     conn.close()
@@ -614,11 +640,9 @@ def resend_otp():
         return redirect(url_for("verify_otp"))
     code = f"{secrets.randbelow(1_000_000):06d}"
     sent_at = utc_now()
-    try:
-        send_otp_email(user["email"], user["full_name"] or "there", code)
-    except (OSError, RuntimeError, ValueError) as exc:
+    if not send_otp_email(user["email"], user["full_name"] or "there", code):
         conn.close()
-        flash(str(exc), "danger")
+        flash("Unable to send the verification email. Please try again later.", "danger")
         return redirect(url_for("verify_otp"))
     conn.execute(
         "UPDATE otp_verifications SET otp_hash=?,expires_at=?,attempts=0,resend_count=resend_count+1,last_sent_at=? WHERE user_id=?",
