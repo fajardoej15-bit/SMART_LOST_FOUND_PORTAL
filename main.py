@@ -1,9 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+import hashlib
+import hmac
+from email.message import EmailMessage
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
@@ -30,6 +34,7 @@ app.config.update(
     ALLOWED_EXTENSIONS={"png", "jpg", "jpeg", "gif", "webp", "pdf"},
     AVATAR_EXTENSIONS={"png", "jpg", "jpeg"},
 )
+init_db()
 
 CATEGORIES = [
     "Identification / Cards",
@@ -60,6 +65,88 @@ ALL_BARANGAYS = [barangay for district in BARANGAYS.values() for barangay in dis
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+OTP_EXPIRY_MINUTES = 10
+OTP_RESEND_COOLDOWN_SECONDS = 60
+OTP_MAX_ATTEMPTS = 5
+OTP_MAX_RESENDS = 5
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def parse_utc(value):
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+
+
+def otp_hash(code):
+    return hmac.new(
+        str(app.config["SECRET_KEY"]).encode(),
+        code.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def mail_configuration():
+    return {
+        "server": os.getenv("MAIL_SERVER", "smtp.gmail.com"),
+        "port": int(os.getenv("MAIL_PORT", "587")),
+        "username": os.getenv("MAIL_USERNAME", "").strip(),
+        "password": os.getenv("MAIL_PASSWORD", ""),
+        "use_tls": os.getenv("MAIL_USE_TLS", "true").lower() == "true",
+    }
+
+
+def send_otp_email(email, full_name, code):
+    config = mail_configuration()
+    if not config["username"] or not config["password"]:
+        raise RuntimeError("Email verification is not configured. Please contact the administrator.")
+    message = EmailMessage()
+    message["Subject"] = "SMART Lost & Found - Email Verification"
+    message["From"] = config["username"]
+    message["To"] = email
+    message.set_content(
+        f"Hello {full_name},\n\n"
+        "Thank you for registering with SMART Lost & Found Pasig.\n\n"
+        f"Your verification code is:\n\n{code}\n\n"
+        "This code expires in 10 minutes.\n\n"
+        "If you did not create this account, you can ignore this email.\n\n"
+        "Thank you,\nSMART Lost & Found Pasig"
+    )
+    with smtplib.SMTP(config["server"], config["port"], timeout=20) as smtp:
+        if config["use_tls"]:
+            smtp.starttls()
+        smtp.login(config["username"], config["password"])
+        smtp.send_message(message)
+
+
+def issue_otp(conn, user):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    sent_at = utc_now()
+    conn.execute(
+        "INSERT INTO otp_verifications(user_id,otp_hash,expires_at,attempts,resend_count,last_sent_at) "
+        "VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET otp_hash=excluded.otp_hash,"
+        "expires_at=excluded.expires_at,attempts=0,resend_count=otp_verifications.resend_count,"
+        "last_sent_at=excluded.last_sent_at",
+        (user["id"], otp_hash(code), (sent_at + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat(), 0, 0, sent_at.isoformat()),
+    )
+    send_otp_email(user["email"], user["full_name"] or "there", code)
+
+
+def pending_verification_user():
+    user_id = session.get("pending_verification_user_id")
+    if not user_id:
+        return None
+    conn = get_connection()
+    user = conn.execute(
+        "SELECT id,email,full_name,account_status FROM users WHERE id=? AND account_status='PENDING'",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return user
 
 
 def is_admin(user=None):
@@ -401,17 +488,31 @@ def register():
                     return render_template("register.html")
 
                 username = "user_" + secrets.token_hex(5)
+                pending_user = {
+                    "id": None,
+                    "email": email,
+                    "full_name": full_name,
+                }
                 conn.execute(
                     "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "ACTIVE", now(), profile_picture)
+                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture)
                 )
-                log_action(conn, "USER_REGISTERED", f"{full_name} created a new account.")
-                notify_admins(conn, f"New user registration: {full_name} created an account.", "NEW_USER")
+                pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                try:
+                    issue_otp(conn, pending_user)
+                except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as exc:
+                    conn.rollback()
+                    conn.close()
+                    delete_avatar(profile_picture)
+                    flash(str(exc), "danger")
+                    return render_template("register.html")
+                log_action(conn, "USER_REGISTERED_PENDING", f"{full_name} started email verification.")
                 conn.commit()
                 conn.close()
-                flash("Account created successfully. You can now log in.", "success")
-                return redirect(url_for("login"))
+                session["pending_verification_user_id"] = pending_user["id"]
+                flash("A verification code has been sent to your email.", "success")
+                return redirect(url_for("verify_otp"))
     return render_template("register.html")
 
 
@@ -424,8 +525,98 @@ def login():
             session.update(user_id=result["id"], email=result["email"], role=result["role"])
             flash("Welcome back.", "success")
             return redirect(request.args.get("next") or (url_for("admin_dashboard") if is_admin(result) else url_for("dashboard")))
+        if isinstance(result, str) and result == "Please verify your email before logging in.":
+            conn = get_connection()
+            user = conn.execute(
+                "SELECT id FROM users WHERE lower(email)=lower(?) AND account_status='PENDING'",
+                (request.form.get("email", "").strip(),),
+            ).fetchone()
+            conn.close()
+            if user:
+                session["pending_verification_user_id"] = user["id"]
+                return redirect(url_for("verify_otp"))
         flash(result, "danger")
     return render_template("login.html")
+
+
+@app.route("/verify-otp", methods=["GET", "POST"])
+def verify_otp():
+    user = pending_verification_user()
+    if not user:
+        session.pop("pending_verification_user_id", None)
+        flash("There is no pending email verification.", "info")
+        return redirect(url_for("register"))
+    conn = get_connection()
+    challenge = conn.execute("SELECT * FROM otp_verifications WHERE user_id=?", (user["id"],)).fetchone()
+    if not challenge:
+        conn.close()
+        flash("Please request a new verification code.", "danger")
+        return render_template("verify_otp.html", cooldown=0)
+    if request.method == "POST":
+        code = request.form.get("otp", "").strip()
+        if not re.fullmatch(r"\d{6}", code):
+            flash("Invalid OTP.", "danger")
+        elif parse_utc(challenge["expires_at"]) <= utc_now():
+            flash("OTP has expired.", "danger")
+        elif challenge["attempts"] >= OTP_MAX_ATTEMPTS:
+            flash("Too many attempts. Please request a new OTP.", "danger")
+        elif not hmac.compare_digest(otp_hash(code), challenge["otp_hash"]):
+            attempts = challenge["attempts"] + 1
+            conn.execute("UPDATE otp_verifications SET attempts=? WHERE user_id=?", (attempts, user["id"]))
+            conn.commit()
+            flash("Too many attempts. Please request a new OTP." if attempts >= OTP_MAX_ATTEMPTS else "Invalid OTP.", "danger")
+        else:
+            conn.execute("UPDATE users SET account_status='ACTIVE' WHERE id=?", (user["id"],))
+            conn.execute("DELETE FROM otp_verifications WHERE user_id=?", (user["id"],))
+            log_action(conn, "EMAIL_VERIFIED", f"{user['full_name']} verified their email address.")
+            notify_admins(conn, f"New user registration: {user['full_name']} created an account.", "NEW_USER")
+            conn.commit()
+            conn.close()
+            session.pop("pending_verification_user_id", None)
+            flash("Email verified successfully. You can now log in.", "success")
+            return redirect(url_for("login"))
+    cooldown = max(0, OTP_RESEND_COOLDOWN_SECONDS - int((utc_now() - parse_utc(challenge["last_sent_at"])).total_seconds()))
+    conn.close()
+    return render_template("verify_otp.html", cooldown=cooldown)
+
+
+@app.post("/verify-otp/resend")
+def resend_otp():
+    user = pending_verification_user()
+    if not user:
+        flash("There is no pending email verification.", "info")
+        return redirect(url_for("register"))
+    conn = get_connection()
+    challenge = conn.execute("SELECT * FROM otp_verifications WHERE user_id=?", (user["id"],)).fetchone()
+    if not challenge:
+        conn.close()
+        flash("Please restart registration to request a verification code.", "danger")
+        return redirect(url_for("register"))
+    elapsed = (utc_now() - parse_utc(challenge["last_sent_at"])).total_seconds()
+    if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+        conn.close()
+        flash(f"Please wait {OTP_RESEND_COOLDOWN_SECONDS - int(elapsed)} seconds before requesting another code.", "danger")
+        return redirect(url_for("verify_otp"))
+    if challenge["resend_count"] >= OTP_MAX_RESENDS:
+        conn.close()
+        flash("Too many OTP resend requests. Please try again later.", "danger")
+        return redirect(url_for("verify_otp"))
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    sent_at = utc_now()
+    try:
+        send_otp_email(user["email"], user["full_name"] or "there", code)
+    except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as exc:
+        conn.close()
+        flash(str(exc), "danger")
+        return redirect(url_for("verify_otp"))
+    conn.execute(
+        "UPDATE otp_verifications SET otp_hash=?,expires_at=?,attempts=0,resend_count=resend_count+1,last_sent_at=? WHERE user_id=?",
+        (otp_hash(code), (sent_at + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat(), sent_at.isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+    flash("A new OTP has been sent.", "success")
+    return redirect(url_for("verify_otp"))
 
 
 @app.route("/logout")

@@ -32,6 +32,13 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT NOT NULL, details TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER, item_id INTEGER, claim_id INTEGER, body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, read_at TEXT, FOREIGN KEY(sender_id) REFERENCES users(id), FOREIGN KEY(recipient_id) REFERENCES users(id), FOREIGN KEY(item_id) REFERENCES items(id), FOREIGN KEY(claim_id) REFERENCES claims(id))")
     cursor.execute("CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, claim_id INTEGER, item_id INTEGER, message TEXT NOT NULL, notification_type TEXT NOT NULL DEFAULT 'INFO', is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id), FOREIGN KEY(claim_id) REFERENCES claims(id), FOREIGN KEY(item_id) REFERENCES items(id))")
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS otp_verifications ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, "
+        "otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+        "resend_count INTEGER NOT NULL DEFAULT 0, last_sent_at TEXT NOT NULL, "
+        "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"
+    )
 
     add_column(cursor, "users", "full_name", "TEXT")
     add_column(cursor, "users", "student_id", "TEXT")
