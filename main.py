@@ -3,12 +3,13 @@ from functools import wraps
 from pathlib import Path
 import hashlib
 import hmac
-from email.message import EmailMessage
+import json
 import os
 import re
 import secrets
-import smtplib
 import sqlite3
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
@@ -33,19 +34,6 @@ app.config.update(
     MAX_CONTENT_LENGTH=5 * 1024 * 1024,
     ALLOWED_EXTENSIONS={"png", "jpg", "jpeg", "gif", "webp", "pdf"},
     AVATAR_EXTENSIONS={"png", "jpg", "jpeg"},
-)
-# TEMPORARY_RENDER_MAIL_DIAGNOSTIC: remove after checking the deployed startup logs.
-_mail_password = os.getenv("MAIL_PASSWORD", "")
-app.logger.info(
-    "Render mail environment diagnostic: "
-    "MAIL_USERNAME_nonempty=%s MAIL_PASSWORD_nonempty=%s MAIL_PASSWORD_length=%d "
-    "MAIL_SERVER_exists=%s MAIL_PORT_exists=%s MAIL_USE_TLS_exists=%s",
-    bool(os.getenv("MAIL_USERNAME", "").strip()),
-    bool(_mail_password),
-    len(_mail_password),
-    bool(os.getenv("MAIL_SERVER")),
-    bool(os.getenv("MAIL_PORT")),
-    bool(os.getenv("MAIL_USE_TLS")),
 )
 init_db()
 
@@ -102,37 +90,39 @@ def otp_hash(code):
     ).hexdigest()
 
 
-def mail_configuration():
-    return {
-        "server": os.getenv("MAIL_SERVER", "smtp.gmail.com"),
-        "port": int(os.getenv("MAIL_PORT", "587")),
-        "username": os.getenv("MAIL_USERNAME", "").strip(),
-        "password": os.getenv("MAIL_PASSWORD", ""),
-        "use_tls": os.getenv("MAIL_USE_TLS", "true").lower() == "true",
-    }
-
-
 def send_otp_email(email, full_name, code):
-    config = mail_configuration()
-    if not config["username"] or not config["password"]:
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
         raise RuntimeError("Email verification is not configured. Please contact the administrator.")
-    message = EmailMessage()
-    message["Subject"] = "SMART Lost & Found - Email Verification"
-    message["From"] = config["username"]
-    message["To"] = email
-    message.set_content(
-        f"Hello {full_name},\n\n"
-        "Thank you for registering with SMART Lost & Found Pasig.\n\n"
-        f"Your verification code is:\n\n{code}\n\n"
-        "This code expires in 10 minutes.\n\n"
-        "If you did not create this account, you can ignore this email.\n\n"
-        "Thank you,\nSMART Lost & Found Pasig"
+
+    payload = {
+        "from": "SMART Lost & Found <onboarding@resend.dev>",
+        "to": [email],
+        "subject": "SMART Lost & Found - Email Verification",
+        "text": (
+            f"Hello {full_name},\n\n"
+            "Thank you for registering with SMART Lost & Found Pasig.\n\n"
+            f"Your verification code is:\n\n{code}\n\n"
+            "This code expires in 10 minutes.\n\n"
+            "If you did not create this account, you can ignore this email.\n\n"
+            "Thank you,\nSMART Lost & Found Pasig"
+        ),
+    }
+    request = Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
     )
-    with smtplib.SMTP(config["server"], config["port"], timeout=20) as smtp:
-        if config["use_tls"]:
-            smtp.starttls()
-        smtp.login(config["username"], config["password"])
-        smtp.send_message(message)
+    try:
+        with urlopen(request, timeout=20) as response:
+            if response.status not in {200, 201}:
+                raise RuntimeError("The email service rejected the verification email.")
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError("Unable to send the verification email. Please try again later.") from exc
 
 
 def issue_otp(conn, user):
@@ -514,7 +504,7 @@ def register():
                 pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 try:
                     issue_otp(conn, pending_user)
-                except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as exc:
+                except (OSError, RuntimeError, ValueError) as exc:
                     conn.rollback()
                     conn.close()
                     delete_avatar(profile_picture)
@@ -618,7 +608,7 @@ def resend_otp():
     sent_at = utc_now()
     try:
         send_otp_email(user["email"], user["full_name"] or "there", code)
-    except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         conn.close()
         flash(str(exc), "danger")
         return redirect(url_for("verify_otp"))
